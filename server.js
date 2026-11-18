@@ -59,7 +59,7 @@ app.delete("/api/v1/faculties/:id", async (req, res) => {
 
 //Test route
 app.get("/", (_req, res) => {
-  res.json({ message: "API is working pipeline pipeline" });
+  res.json({ message: "API is working with Docker and ECS" });
 });
 // Start the server
 const PORT = process.env.PORT || 4000;

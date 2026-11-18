@@ -9,7 +9,6 @@ on:
 jobs:
   deploy:
     runs-on: [self-hosted, Windows, X64]
-
     defaults:
       run:
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -18,14 +17,11 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.FLOCI_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.FLOCI_AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-1
-
       FLOCI_ENDPOINT: http://localhost:4566
-
       ECR_REGISTRY: 127.0.0.1:4566
       ECR_NAMESPACE: 000000000000/us-east-1
       ECS_TASK_REGISTRY: localhost:4566
       ECR_REPOSITORY: ec2-docker-cicd-app
-
       ECS_CLUSTER: node-mongo-cluster
       ECS_SERVICE: ec2-docker-cicd-service
 
@@ -33,85 +29,83 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Verify Docker daemon and AWS CLI
+      - name: Verify Docker and AWS CLI
         run: |
           $dockerVersion = cmd /c "docker version 2>&1"
           if ($LASTEXITCODE -ne 0) {
             throw "Docker daemon is unavailable to the runner account. Check Docker Desktop, the runner's Docker context, and Docker pipe access.`n$($dockerVersion -join "`n")"
           }
           $dockerVersion
-
           aws --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "AWS CLI version check failed"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "AWS CLI version check failed" }
 
-      - name: Login to FLoCI ECR
-        run: |
-          $password = aws ecr get-login-password `
-            --endpoint-url $env:FLOCI_ENDPOINT
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "ECR login failed"
-          }
-
-          $password | docker login `
-            --username AWS `
-            --password-stdin $env:ECR_REGISTRY
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker login failed"
-          }
-
-      - name: Build Docker image
+      - name: Build and push image
         run: |
           $image = "$env:ECR_REGISTRY/$env:ECR_NAMESPACE/$env:ECR_REPOSITORY`:latest"
           $taskImage = "$env:ECS_TASK_REGISTRY/$env:ECR_NAMESPACE/$env:ECR_REPOSITORY`:latest"
 
+          $password = aws ecr get-login-password --endpoint-url $env:FLOCI_ENDPOINT
+          if ($LASTEXITCODE -ne 0) { throw "ECR login failed" }
+          $password | docker login --username AWS --password-stdin $env:ECR_REGISTRY
+          if ($LASTEXITCODE -ne 0) { throw "Docker login failed" }
+
           docker build -t $image .
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker build failed"
-          }
-
+          if ($LASTEXITCODE -ne 0) { throw "Docker build failed" }
           docker tag $image $taskImage
+          if ($LASTEXITCODE -ne 0) { throw "Docker task image tag failed" }
+          docker push $image
+          if ($LASTEXITCODE -ne 0) { throw "Docker push failed" }
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker task image tag failed"
-          }
-
-      - name: Push image to ECR
+      - name: Deploy and verify
         run: |
           $image = "$env:ECR_REGISTRY/$env:ECR_NAMESPACE/$env:ECR_REPOSITORY`:latest"
+          $expectedImageId = docker image inspect --format '{{.Id}}' $image
+          if ($LASTEXITCODE -ne 0 -or -not $expectedImageId) { throw "Could not inspect built image" }
 
-          docker push $image
+          $oldTasks = aws ecs list-tasks --cluster $env:ECS_CLUSTER --service-name $env:ECS_SERVICE --desired-status RUNNING --endpoint-url $env:FLOCI_ENDPOINT --output json
+          if ($LASTEXITCODE -ne 0) { throw "Could not list existing ECS tasks" }
+          $oldTasks = @(($oldTasks | ConvertFrom-Json).taskArns | Where-Object { $_ })
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker push failed"
+          aws ecs update-service --cluster $env:ECS_CLUSTER --service $env:ECS_SERVICE --task-definition ec2-docker-cicd-task:1 --force-new-deployment --endpoint-url $env:FLOCI_ENDPOINT
+          if ($LASTEXITCODE -ne 0) { throw "ECS service update failed" }
+          foreach ($task in $oldTasks) {
+            aws ecs stop-task --cluster $env:ECS_CLUSTER --task $task --reason "Release host port for deployment" --endpoint-url $env:FLOCI_ENDPOINT
+            if ($LASTEXITCODE -ne 0) { throw "Could not stop ECS task $task" }
           }
 
-      - name: Deploy existing ECS task definition
-        run: |
-          aws ecs update-service `
-            --cluster $env:ECS_CLUSTER `
-            --service $env:ECS_SERVICE `
-            --task-definition ec2-docker-cicd-task:1 `
-            --force-new-deployment `
-            --endpoint-url $env:FLOCI_ENDPOINT
+          $deadline = (Get-Date).AddMinutes(3)
+          do {
+            $result = aws ecs describe-services --cluster $env:ECS_CLUSTER --services $env:ECS_SERVICE --endpoint-url $env:FLOCI_ENDPOINT --output json
+            if ($LASTEXITCODE -ne 0) { throw "Could not describe ECS service" }
+            $result = $result | ConvertFrom-Json
+            if (@($result.failures).Count -gt 0 -or @($result.services).Count -ne 1) { throw "Could not find ECS service $env:ECS_SERVICE" }
+            $service = $result.services[0]
+            $ready = $service.desiredCount -gt 0 -and $service.runningCount -eq $service.desiredCount -and
+              $service.pendingCount -eq 0 -and @($service.deployments).Count -eq 1 -and
+              $service.deployments[0].rolloutState -eq "COMPLETED"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "ECS service update failed"
-          }
+            if ($ready) {
+              $tasks = aws ecs list-tasks --cluster $env:ECS_CLUSTER --service-name $env:ECS_SERVICE --desired-status RUNNING --endpoint-url $env:FLOCI_ENDPOINT --output json
+              if ($LASTEXITCODE -ne 0) { throw "Could not list ECS tasks" }
+              $tasks = @(($tasks | ConvertFrom-Json).taskArns | Where-Object { $_ })
+              $ready = $tasks.Count -eq $service.desiredCount
+              if ($ready) {
+                $details = aws ecs describe-tasks --cluster $env:ECS_CLUSTER --tasks $tasks --endpoint-url $env:FLOCI_ENDPOINT --output json
+                if ($LASTEXITCODE -ne 0) { throw "Could not describe ECS tasks" }
+                $details = $details | ConvertFrom-Json
+                if (@($details.failures).Count -gt 0 -or @($details.tasks).Count -ne $tasks.Count) { throw "Could not describe all ECS tasks" }
+                foreach ($task in $details.tasks) {
+                  $container = @($task.containers | Where-Object { $_.name -eq $env:ECR_REPOSITORY })
+                  if ($task.lastStatus -ne "RUNNING" -or $container.Count -ne 1 -or -not $container[0].runtimeId) { $ready = $false; break }
+                  $actualImageId = docker inspect --format '{{.Image}}' $container[0].runtimeId
+                  if ($LASTEXITCODE -ne 0) { throw "Could not inspect running task container" }
+                  if ($actualImageId -ne $expectedImageId) { $ready = $false; break }
+                }
+              }
+            }
+            if ($ready) { break }
+            Start-Sleep -Seconds 5
+          } while ((Get-Date) -lt $deadline)
 
-      - name: Wait for ECS service stability
-        run: |
-          aws ecs wait services-stable `
-            --cluster $env:ECS_CLUSTER `
-            --services $env:ECS_SERVICE `
-            --endpoint-url $env:FLOCI_ENDPOINT
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "ECS deployment failed"
-          }
-
-          Write-Host "Deployment successful!"
+          if (-not $ready) { throw "ECS service did not deploy the built image" }
+          Write-Host "Deployment successful: all service tasks use image $expectedImageId"
