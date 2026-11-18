@@ -9,7 +9,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const faculties = [];
+const faculties = [
+  { id: "1", name: "John Doe", department: "Computer Science", age: 40 },
+  { id: "2", name: "Jane Smith", department: "Mathematics", age: 35 },
+  { id: "3", name: "Alice Johnson", department: "Physics", age: 45 },
+];
 // Routes setup
 app.post("/api/v1/faculties", async (req, res) => {
   try {
