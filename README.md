@@ -1,15 +1,15 @@
 # FLoCI EC2 deployment
 
 The GitHub Actions workflow deploys this app to a Docker-enabled FLoCI EC2
-instance over SSH. It builds the image on the instance; it does not use ECR or
-ECS. Each deployment replaces the `ec2-docker-cicd-app` container, so its
+instance over SSH. It builds the image on the runner and transfers it to the
+instance; it does not use ECR or ECS. Each deployment replaces the `ec2-docker-cicd-app` container, so its
 in-memory faculty records are lost.
 
 ## Prerequisites
 
-- A Windows x64 self-hosted GitHub Actions runner with Git and OpenSSH (`ssh`
-  and `scp`) available. The runner must reach the instance's SSH port.
-- A running FLoCI EC2 instance with `tar`, `scp`, and a running Docker
+- A Windows x64 self-hosted GitHub Actions runner with Git, Docker and OpenSSH
+  (`ssh` and `scp`) available. The runner must reach the instance's SSH port.
+- A running FLoCI EC2 instance with `scp` and a running Docker
   daemon. The SSH user must be allowed to use Docker. FLoCI EC2 instances are
   themselves containers; Docker must be configured inside the guest or
   otherwise provided to it. Installing the Docker client alone is insufficient.
@@ -41,13 +41,9 @@ the instance and forwarding again. No security-group rule was added.
 
 ## GitHub Actions configuration
 
-Set these repository **variables**:
-
-| Variable | Description |
-| --- | --- |
-| `EC2_HOST` | SSH host, for example `127.0.0.1` for the local instance |
-| `EC2_PORT` | SSH port, for example `2200` |
-| `EC2_USER` | SSH login user; FLoCI's key injection normally uses `root` |
+Set repository variables `EC2_HOST`, `EC2_PORT`, and `EC2_USER` to
+`127.0.0.1`, `2200`, and `root` respectively for the existing local instance.
+Update these variables and the host-key secret if the instance changes.
 
 Set these repository **secrets**:
 
@@ -67,7 +63,12 @@ For the local instance, its public host key can be read from the guest with
 Prefix its key type and public-key fields with `[127.0.0.1]:2200` to form the
 known-hosts entry: `[127.0.0.1]:2200 <key-type> <public-key>`.
 
-Push to `main` or run the workflow manually. It archives the checked-out commit,
-uploads it over SSH, builds the image, and replaces the instance's container.
-It does not verify application readiness; check the forwarded application URL
-and the GitHub Actions log after deployment.
+Push to `main` or run the workflow manually. It builds and saves an image on the
+runner, uploads it over SSH, and replaces the instance's container. The final
+step checks the forwarded application URL.
+
+The same SSH, image transfer, and Docker deployment steps can be used with a
+real EC2 instance. For AWS, use a runner that can reach the instance, change
+the SSH host, port and user variables, configure the instance's security
+group, and replace both SSH secrets with the correct key and verified host key.
+`127.0.0.1` refers to the runner itself, not a remote EC2 instance.

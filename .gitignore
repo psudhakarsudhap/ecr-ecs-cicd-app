@@ -3,5 +3,4 @@ npm-debug.log
 dist
 .env
 floci*
-.dockerignore
 actions-runner/

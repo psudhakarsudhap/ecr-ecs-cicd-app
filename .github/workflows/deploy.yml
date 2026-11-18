@@ -21,64 +21,108 @@ jobs:
       EC2_HOST: ${{ vars.EC2_HOST }}
       EC2_PORT: ${{ vars.EC2_PORT }}
       EC2_USER: ${{ vars.EC2_USER }}
-      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-      EC2_SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Deploy over SSH
+      - name: Configure SSH
+        env:
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          EC2_SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
         run: |
-          if ($env:EC2_HOST -notmatch '^[a-zA-Z0-9.-]+$' -or
-              $env:EC2_USER -notmatch '^[a-zA-Z_][a-zA-Z0-9_-]*$' -or
-              $env:EC2_PORT -notmatch '^[0-9]{1,5}$' -or
-              [int]$env:EC2_PORT -lt 1 -or [int]$env:EC2_PORT -gt 65535 -or
-              -not $env:EC2_SSH_PRIVATE_KEY -or -not $env:EC2_SSH_KNOWN_HOSTS) {
-            throw "Configure EC2_HOST, EC2_PORT, EC2_USER and both SSH secrets"
-          }
-
-          $temp = Join-Path $env:RUNNER_TEMP ("ec2-deploy-" + [guid]::NewGuid())
-          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $id = [guid]::NewGuid().ToString("N")
+          $temp = Join-Path $env:RUNNER_TEMP "ec2-deploy-$id"
           $acl = New-Object System.Security.AccessControl.DirectorySecurity
           $acl.SetAccessRuleProtection($true, $false)
           $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $identity, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+            "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
           $acl.AddAccessRule($rule)
           [System.IO.Directory]::CreateDirectory($temp, $acl) | Out-Null
+          "DEPLOY_TEMP=$temp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "REMOTE_IMAGE=/root/ec2-deploy-$id.tar" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          $remoteDir = $null
+          $keyPath = Join-Path $temp "floci-key.pem"
+          $knownHostsPath = Join-Path $temp "known_hosts"
+          $configPath = Join-Path $temp "ssh_config"
+
+          [System.IO.File]::WriteAllText(
+            $keyPath,
+            $env:EC2_SSH_PRIVATE_KEY.TrimEnd() + "`n",
+            [System.Text.Encoding]::ASCII
+          )
+
+          [System.IO.File]::WriteAllText(
+            $knownHostsPath,
+            $env:EC2_SSH_KNOWN_HOSTS.TrimEnd() + "`n",
+            [System.Text.Encoding]::ASCII
+          )
+
+          [System.IO.File]::WriteAllText(
+            $configPath,
+            "Host *`n  IdentityFile `"$keyPath`"`n  UserKnownHostsFile `"$knownHostsPath`"`n  IdentitiesOnly yes`n  BatchMode yes`n  StrictHostKeyChecking yes`n",
+            [System.Text.Encoding]::ASCII
+          )
+
+      - name: Build Docker image
+        run: |
+          $tag = $env:GITHUB_SHA.Substring(0,12)
+          $image = "ec2-docker-cicd-app:$tag"
+
+          docker build -t $image .
+          if ($LASTEXITCODE -ne 0) { throw "Docker build failed" }
+
+          $archive = Join-Path $env:DEPLOY_TEMP "app.tar"
+          docker save -o $archive $image
+          if ($LASTEXITCODE -ne 0) { throw "Docker save failed" }
+
+      - name: Transfer image to EC2
+        run: |
+          $configPath = Join-Path $env:DEPLOY_TEMP "ssh_config"
+          $archive = Join-Path $env:DEPLOY_TEMP "app.tar"
+
+          scp -O -F $configPath -P $env:EC2_PORT `
+            $archive `
+            "$($env:EC2_USER)@$($env:EC2_HOST):$env:REMOTE_IMAGE"
+
+          if ($LASTEXITCODE -ne 0) { throw "Image transfer failed" }
+
+      - name: Deploy Docker container inside EC2
+        run: |
+          $configPath = Join-Path $env:DEPLOY_TEMP "ssh_config"
+          $tag = $env:GITHUB_SHA.Substring(0,12)
+          $image = "ec2-docker-cicd-app:$tag"
+
+          $remoteCommand = "docker load -i '$env:REMOTE_IMAGE' && " +
+            'container=$(docker ps -aq --filter name=^/ec2-docker-cicd-app$) && { [ -z "$container" ] || docker rm -f "$container"; } && ' +
+            "docker run -d --restart unless-stopped --name ec2-docker-cicd-app -p 4000:4000 -e PORT=4000 $image"
+
+          ssh -F $configPath -p $env:EC2_PORT `
+            "$($env:EC2_USER)@$($env:EC2_HOST)" `
+            $remoteCommand
+
+          if ($LASTEXITCODE -ne 0) { throw "EC2 deployment failed" }
+
+      - name: Verify application
+        run: |
+          Start-Sleep -Seconds 5
+
+          $response = Invoke-RestMethod http://localhost:4000
+          $response | ConvertTo-Json
+
+      - name: Cleanup
+        if: ${{ always() }}
+        run: |
           try {
-            $key = Join-Path $temp "id_key"
-            $knownHosts = Join-Path $temp "known_hosts"
-            $sshConfig = Join-Path $temp "ssh_config"
-            $archive = Join-Path $temp "source.tar"
-            [System.IO.File]::WriteAllText($key, ($env:EC2_SSH_PRIVATE_KEY.TrimEnd() + "`n"), [System.Text.Encoding]::ASCII)
-            [System.IO.File]::WriteAllText($knownHosts, ($env:EC2_SSH_KNOWN_HOSTS.TrimEnd() + "`n"), [System.Text.Encoding]::ASCII)
-            [System.IO.File]::WriteAllText($sshConfig, "Host *`n  UserKnownHostsFile `"$knownHosts`"`n", [System.Text.Encoding]::ASCII)
-            git archive --format=tar "--output=$archive" HEAD
-            if ($LASTEXITCODE -ne 0) { throw "Could not archive source" }
-
-            $remote = "$env:EC2_USER@$env:EC2_HOST"
-            $options = @("-F", $sshConfig, "-i", $key, "-o", "IdentitiesOnly=yes",
-              "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes")
-            $remoteDir = ssh @options -p $env:EC2_PORT $remote "mktemp -d /tmp/ec2-docker-cicd-XXXXXXXX"
-            if ($LASTEXITCODE -ne 0 -or $remoteDir -notmatch '^/tmp/ec2-docker-cicd-[a-zA-Z0-9]{8}$') {
-              $remoteDir = $null
-              throw "Could not create a temporary directory on EC2"
+            if ($env:DEPLOY_TEMP -and $env:REMOTE_IMAGE) {
+              $configPath = Join-Path $env:DEPLOY_TEMP "ssh_config"
+              if (Test-Path -LiteralPath $configPath) {
+                ssh -F $configPath -p $env:EC2_PORT "$env:EC2_USER@$env:EC2_HOST" "rm -f -- '$env:REMOTE_IMAGE'"
+                if ($LASTEXITCODE -ne 0) { throw "Could not remove the EC2 image archive" }
+              }
             }
-            scp -O @options -P $env:EC2_PORT $archive "${remote}:$remoteDir/source.tar"
-            if ($LASTEXITCODE -ne 0) { throw "Could not upload source to EC2" }
-
-            $command = "tar -xf '$remoteDir/source.tar' -C '$remoteDir' && docker build -t ec2-docker-cicd-app:latest '$remoteDir' && " +
-              'container=$(docker ps -aq --filter name=^/ec2-docker-cicd-app$) && { [ -z "$container" ] || docker rm -f "$container"; } && docker run -d --name ec2-docker-cicd-app --restart unless-stopped -p 4000:4000 ec2-docker-cicd-app:latest'
-            ssh @options -p $env:EC2_PORT $remote $command
-            if ($LASTEXITCODE -ne 0) { throw "EC2 deployment failed" }
           }
           finally {
-            if ($remoteDir) {
-              ssh @options -p $env:EC2_PORT $remote "rm -rf -- '$remoteDir'"
-              if ($LASTEXITCODE -ne 0) { Write-Warning "Could not remove temporary EC2 directory $remoteDir" }
-            }
-            Remove-Item -LiteralPath $temp -Recurse -Force
+            if ($env:DEPLOY_TEMP) { Remove-Item -LiteralPath $env:DEPLOY_TEMP -Recurse -Force }
           }
