@@ -1,10 +1,14 @@
-name: Deploy Express App to FLoCI ECS
+name: Deploy Express App to FLoCI EC2
 
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+
+concurrency:
+  group: floci-ec2-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -14,98 +18,67 @@ jobs:
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
 
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.FLOCI_AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.FLOCI_AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-east-1
-      FLOCI_ENDPOINT: http://localhost:4566
-      ECR_REGISTRY: 127.0.0.1:4566
-      ECR_NAMESPACE: 000000000000/us-east-1
-      ECS_TASK_REGISTRY: localhost:4566
-      ECR_REPOSITORY: ec2-docker-cicd-app
-      ECS_CLUSTER: node-mongo-cluster
-      ECS_SERVICE: ec2-docker-cicd-service
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_PORT: ${{ vars.EC2_PORT }}
+      EC2_USER: ${{ vars.EC2_USER }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+      EC2_SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Verify Docker and AWS CLI
+      - name: Deploy over SSH
         run: |
-          $dockerVersion = cmd /c "docker version 2>&1"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker daemon is unavailable to the runner account. Check Docker Desktop, the runner's Docker context, and Docker pipe access.`n$($dockerVersion -join "`n")"
-          }
-          $dockerVersion
-          aws --version
-          if ($LASTEXITCODE -ne 0) { throw "AWS CLI version check failed" }
-
-      - name: Build and push image
-        run: |
-          $image = "$env:ECR_REGISTRY/$env:ECR_NAMESPACE/$env:ECR_REPOSITORY`:latest"
-          $taskImage = "$env:ECS_TASK_REGISTRY/$env:ECR_NAMESPACE/$env:ECR_REPOSITORY`:latest"
-
-          $password = aws ecr get-login-password --endpoint-url $env:FLOCI_ENDPOINT
-          if ($LASTEXITCODE -ne 0) { throw "ECR login failed" }
-          $password | docker login --username AWS --password-stdin $env:ECR_REGISTRY
-          if ($LASTEXITCODE -ne 0) { throw "Docker login failed" }
-
-          docker build -t $image .
-          if ($LASTEXITCODE -ne 0) { throw "Docker build failed" }
-          docker tag $image $taskImage
-          if ($LASTEXITCODE -ne 0) { throw "Docker task image tag failed" }
-          docker push $image
-          if ($LASTEXITCODE -ne 0) { throw "Docker push failed" }
-
-      - name: Deploy and verify
-        run: |
-          $image = "$env:ECR_REGISTRY/$env:ECR_NAMESPACE/$env:ECR_REPOSITORY`:latest"
-          $expectedImageId = docker image inspect --format '{{.Id}}' $image
-          if ($LASTEXITCODE -ne 0 -or -not $expectedImageId) { throw "Could not inspect built image" }
-
-          $oldTasks = aws ecs list-tasks --cluster $env:ECS_CLUSTER --service-name $env:ECS_SERVICE --desired-status RUNNING --endpoint-url $env:FLOCI_ENDPOINT --output json
-          if ($LASTEXITCODE -ne 0) { throw "Could not list existing ECS tasks" }
-          $oldTasks = @(($oldTasks | ConvertFrom-Json).taskArns | Where-Object { $_ })
-
-          aws ecs update-service --cluster $env:ECS_CLUSTER --service $env:ECS_SERVICE --task-definition ec2-docker-cicd-task:1 --force-new-deployment --endpoint-url $env:FLOCI_ENDPOINT
-          if ($LASTEXITCODE -ne 0) { throw "ECS service update failed" }
-          foreach ($task in $oldTasks) {
-            aws ecs stop-task --cluster $env:ECS_CLUSTER --task $task --reason "Release host port for deployment" --endpoint-url $env:FLOCI_ENDPOINT
-            if ($LASTEXITCODE -ne 0) { throw "Could not stop ECS task $task" }
+          if ($env:EC2_HOST -notmatch '^[a-zA-Z0-9.-]+$' -or
+              $env:EC2_USER -notmatch '^[a-zA-Z_][a-zA-Z0-9_-]*$' -or
+              $env:EC2_PORT -notmatch '^[0-9]{1,5}$' -or
+              [int]$env:EC2_PORT -lt 1 -or [int]$env:EC2_PORT -gt 65535 -or
+              -not $env:EC2_SSH_PRIVATE_KEY -or -not $env:EC2_SSH_KNOWN_HOSTS) {
+            throw "Configure EC2_HOST, EC2_PORT, EC2_USER and both SSH secrets"
           }
 
-          $deadline = (Get-Date).AddMinutes(3)
-          do {
-            $result = aws ecs describe-services --cluster $env:ECS_CLUSTER --services $env:ECS_SERVICE --endpoint-url $env:FLOCI_ENDPOINT --output json
-            if ($LASTEXITCODE -ne 0) { throw "Could not describe ECS service" }
-            $result = $result | ConvertFrom-Json
-            if (@($result.failures).Count -gt 0 -or @($result.services).Count -ne 1) { throw "Could not find ECS service $env:ECS_SERVICE" }
-            $service = $result.services[0]
-            $ready = $service.desiredCount -gt 0 -and $service.runningCount -eq $service.desiredCount -and
-              $service.pendingCount -eq 0 -and @($service.deployments).Count -eq 1 -and
-              $service.deployments[0].rolloutState -eq "COMPLETED"
+          $temp = Join-Path $env:RUNNER_TEMP ("ec2-deploy-" + [guid]::NewGuid())
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $acl = New-Object System.Security.AccessControl.DirectorySecurity
+          $acl.SetAccessRuleProtection($true, $false)
+          $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $identity, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+          $acl.AddAccessRule($rule)
+          [System.IO.Directory]::CreateDirectory($temp, $acl) | Out-Null
 
-            if ($ready) {
-              $tasks = aws ecs list-tasks --cluster $env:ECS_CLUSTER --service-name $env:ECS_SERVICE --desired-status RUNNING --endpoint-url $env:FLOCI_ENDPOINT --output json
-              if ($LASTEXITCODE -ne 0) { throw "Could not list ECS tasks" }
-              $tasks = @(($tasks | ConvertFrom-Json).taskArns | Where-Object { $_ })
-              $ready = $tasks.Count -eq $service.desiredCount
-              if ($ready) {
-                $details = aws ecs describe-tasks --cluster $env:ECS_CLUSTER --tasks $tasks --endpoint-url $env:FLOCI_ENDPOINT --output json
-                if ($LASTEXITCODE -ne 0) { throw "Could not describe ECS tasks" }
-                $details = $details | ConvertFrom-Json
-                if (@($details.failures).Count -gt 0 -or @($details.tasks).Count -ne $tasks.Count) { throw "Could not describe all ECS tasks" }
-                foreach ($task in $details.tasks) {
-                  $container = @($task.containers | Where-Object { $_.name -eq $env:ECR_REPOSITORY })
-                  if ($task.lastStatus -ne "RUNNING" -or $container.Count -ne 1 -or -not $container[0].runtimeId) { $ready = $false; break }
-                  $actualImageId = docker inspect --format '{{.Image}}' $container[0].runtimeId
-                  if ($LASTEXITCODE -ne 0) { throw "Could not inspect running task container" }
-                  if ($actualImageId -ne $expectedImageId) { $ready = $false; break }
-                }
-              }
+          $remoteDir = $null
+          try {
+            $key = Join-Path $temp "id_key"
+            $knownHosts = Join-Path $temp "known_hosts"
+            $sshConfig = Join-Path $temp "ssh_config"
+            $archive = Join-Path $temp "source.tar"
+            [System.IO.File]::WriteAllText($key, ($env:EC2_SSH_PRIVATE_KEY.TrimEnd() + "`n"), [System.Text.Encoding]::ASCII)
+            [System.IO.File]::WriteAllText($knownHosts, ($env:EC2_SSH_KNOWN_HOSTS.TrimEnd() + "`n"), [System.Text.Encoding]::ASCII)
+            [System.IO.File]::WriteAllText($sshConfig, "Host *`n  UserKnownHostsFile `"$knownHosts`"`n", [System.Text.Encoding]::ASCII)
+            git archive --format=tar "--output=$archive" HEAD
+            if ($LASTEXITCODE -ne 0) { throw "Could not archive source" }
+
+            $remote = "$env:EC2_USER@$env:EC2_HOST"
+            $options = @("-F", $sshConfig, "-i", $key, "-o", "IdentitiesOnly=yes",
+              "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes")
+            $remoteDir = ssh @options -p $env:EC2_PORT $remote "mktemp -d /tmp/ec2-docker-cicd-XXXXXXXX"
+            if ($LASTEXITCODE -ne 0 -or $remoteDir -notmatch '^/tmp/ec2-docker-cicd-[a-zA-Z0-9]{8}$') {
+              $remoteDir = $null
+              throw "Could not create a temporary directory on EC2"
             }
-            if ($ready) { break }
-            Start-Sleep -Seconds 5
-          } while ((Get-Date) -lt $deadline)
+            scp -O @options -P $env:EC2_PORT $archive "${remote}:$remoteDir/source.tar"
+            if ($LASTEXITCODE -ne 0) { throw "Could not upload source to EC2" }
 
-          if (-not $ready) { throw "ECS service did not deploy the built image" }
-          Write-Host "Deployment successful: all service tasks use image $expectedImageId"
+            $command = "tar -xf '$remoteDir/source.tar' -C '$remoteDir' && docker build -t ec2-docker-cicd-app:latest '$remoteDir' && " +
+              'container=$(docker ps -aq --filter name=^/ec2-docker-cicd-app$) && { [ -z "$container" ] || docker rm -f "$container"; } && docker run -d --name ec2-docker-cicd-app --restart unless-stopped -p 4000:4000 ec2-docker-cicd-app:latest'
+            ssh @options -p $env:EC2_PORT $remote $command
+            if ($LASTEXITCODE -ne 0) { throw "EC2 deployment failed" }
+          }
+          finally {
+            if ($remoteDir) {
+              ssh @options -p $env:EC2_PORT $remote "rm -rf -- '$remoteDir'"
+              if ($LASTEXITCODE -ne 0) { Write-Warning "Could not remove temporary EC2 directory $remoteDir" }
+            }
+            Remove-Item -LiteralPath $temp -Recurse -Force
+          }
